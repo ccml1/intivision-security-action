@@ -1,0 +1,28 @@
+# Configuración de gitleaks: reglas por defecto + reglas propias del proyecto.
+# Origen: la auditoría encontró un hash bcrypt de basic_auth de Caddy en el historial (pista 5),
+# que las reglas por defecto de gitleaks no detectan.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "bcrypt-hash"
+description = "Hash bcrypt versionado (por ejemplo basic_auth de Caddy o seeds de usuarios)"
+regex = '''\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}'''
+tags = ["hash", "bcrypt"]
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Token de bot de Telegram"
+regex = '''\b\d{8,10}:[A-Za-z0-9_-]{35}\b'''
+tags = ["token", "telegram"]
+
+[[rules]]
+id = "postgres-url-with-password"
+description = "URL de PostgreSQL con contraseña real"
+regex = '''postgres(?:ql)?://[^:\s/]+:([^@\s/]{6,})@'''
+secretGroup = 1
+tags = ["database"]
+  [rules.allowlist]
+  description = "Marcadores de ejemplo usados en la documentación del código"
+  regexes = ['''(?i)^(clave|password|contrase(ñ|n)a|changeme|example|xxx+)$''']
