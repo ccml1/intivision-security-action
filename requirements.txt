@@ -10,7 +10,3 @@ uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 psycopg2-binary>=2.9.9
 bcrypt>=4.1.0
-
-# Keep setuptools' vendored libraries and wheel at fixed versions.
-setuptools>=84.2.0
-wheel>=0.46.2
