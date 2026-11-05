@@ -9,6 +9,9 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
+# Upgrade packaging tools in the image build; they are not app dependencies.
+RUN python -m pip install --no-cache-dir --upgrade "setuptools>=84.2.0" "wheel>=0.46.2"
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
