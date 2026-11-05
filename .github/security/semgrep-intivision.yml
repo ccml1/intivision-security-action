@@ -105,12 +105,15 @@ rules:
       category: security
       cwe: "CWE-22: Path Traversal"
 
+  # Componente MQTT fuera de alcance (no desarrollado, ver .github/security/alcance.yml):
+  # se sigue reportando como INFO para que no se pierda cuando se desarrolle.
   - id: intivision.mqtt-without-tls
     languages: [python]
-    severity: WARNING
+    severity: INFO
     message: >-
-      Cliente MQTT que se conecta sin llamar antes a tls_set(): las órdenes de la sirena y las
-      credenciales viajan sin cifrar (auditoría, pista 1).
+      [Fuera de alcance: módulo MQTT no desarrollado] Cliente MQTT que se conecta sin llamar antes a
+      tls_set(): las órdenes de la sirena y las credenciales viajarían sin cifrar (auditoría, pista 1).
+      Revisar antes de conectar un dispositivo físico o desplegar un broker.
     patterns:
       - pattern-inside: |
           def $F(...):
@@ -125,6 +128,7 @@ rules:
       - pattern: $C.connect(...)
     metadata:
       category: security
+      scope: fuera-de-alcance (mqtt, no-desarrollado)
       cwe: "CWE-319: Cleartext Transmission of Sensitive Information"
       audit: "wokwi/sketch.ino:onMessage:unauthenticated-siren-control-on-public-mqtt-broker"
 

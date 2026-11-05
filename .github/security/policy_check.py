@@ -5,12 +5,16 @@ Chequeo de políticas de seguridad derivado de la auditoría (security-audit, ru
 Revisa la configuración versionada (compose, Caddy, MQTT, Dockerfiles, dependencias, ignores) y
 falla si encuentra una violación de nivel "error". Las de nivel "warning" se muestran pero no bloquean.
 
-Uso:  python .github/security/policy_check.py [--root .] [--strict]
-      --strict convierte los warnings en errores.
+Uso:  python .github/security/policy_check.py [--root .] [--strict] [--scope FILE] [--json-out FILE]
+      --strict   convierte los warnings en errores.
+      --scope    archivo de alcance (por defecto .github/security/alcance.yml): los hallazgos de
+                 componentes fuera de alcance se muestran pero no bloquean.
+      --json-out guarda los hallazgos en JSON (lo usa el job de resumen).
 
 Cada regla cita la pista de la auditoría que la originó (ver docs/pipeline-seguridad.md).
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -30,8 +34,9 @@ LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "::1")
 findings = []
 
 
-def add(level, rule, path, line, message):
-    findings.append({"level": level, "rule": rule, "path": path, "line": line or 1, "message": message})
+def add(level, rule, path, line, message, component="general"):
+    findings.append({"level": level, "rule": rule, "path": path, "line": line or 1,
+                     "message": message, "component": component})
 
 
 def read(root, rel):
@@ -67,10 +72,11 @@ def check_compose(root):
             if name in exposed_ok or bound_loopback:
                 continue
             level = "error" if name == "backend" else "warning"
-            add(level, "POL-001", rel, line_of(text, f'"{spec}"') if f'"{spec}"' in text else line_of(text, spec),
+            add(level, "POL-001", rel, line_of(text, spec),
                 f"El servicio '{name}' publica el puerto {spec} en todas las interfaces. "
                 f"Usa '127.0.0.1:{parts[-2] if len(parts) > 1 else parts[0]}:{parts[-1]}' o quita 'ports' "
-                f"y deja que solo Caddy reciba tráfico externo.")
+                f"y deja que solo Caddy reciba tráfico externo.",
+                component="mqtt" if name == "mqtt" else "general")
 
 
 def check_mosquitto(root):
@@ -81,7 +87,8 @@ def check_mosquitto(root):
         return
     if re.search(r"^\s*allow_anonymous\s+true\b", text, re.M):
         add("warning", "POL-002", rel, line_of(text, "allow_anonymous"),
-            "mosquitto permite clientes anónimos. Usa 'allow_anonymous false' con password_file y acl_file.")
+            "mosquitto permite clientes anónimos. Usa 'allow_anonymous false' con password_file y acl_file.",
+            component="mqtt")
 
 
 def check_actuator(root):
@@ -98,14 +105,15 @@ def check_actuator(root):
     if host in PUBLIC_MQTT_BROKERS:
         add("error", "POL-003", rel, line_of(text, "host:"),
             f"El actuador de la sirena usa el broker público '{host}'. Cualquiera que conozca el tópico "
-            f"puede encender o apagar la sirena. Usa un broker propio con usuario/contraseña y TLS.")
+            f"puede encender o apagar la sirena. Usa un broker propio con usuario/contraseña y TLS.",
+            component="mqtt")
     if not act.get("username") and not act.get("password"):
         add("warning", "POL-003b", rel, line_of(text, "username:"),
             "El actuador MQTT no tiene credenciales en config.yaml; verifica que MQTT_USERNAME/MQTT_PASSWORD "
-            "se definan en el despliegue.")
+            "se definan en el despliegue.", component="mqtt")
     if int(act.get("port") or 1883) == 1883:
         add("warning", "POL-003c", rel, line_of(text, "port:"),
-            "MQTT en el puerto 1883 viaja sin cifrar; usa 8883 con TLS.")
+            "MQTT en el puerto 1883 viaja sin cifrar; usa 8883 con TLS.", component="mqtt")
 
 
 def check_firmware(root):
@@ -117,10 +125,11 @@ def check_firmware(root):
     for host in PUBLIC_MQTT_BROKERS:
         if host in text:
             add("warning", "POL-004", rel, line_of(text, host),
-                f"El firmware se conecta al broker público '{host}' sin autenticación.")
-    if re.search(r"\.connect\(\s*\w+\s*\)", text):
+                f"El firmware se conecta al broker público '{host}' sin autenticación.", component="mqtt")
+    if re.search(r"\.connect\(\s*[\w.()]+\s*\)", text):
         add("warning", "POL-004b", rel, line_of(text, ".connect("),
-            "mqtt.connect() sin usuario ni contraseña: cualquier publicador del tópico controla la sirena.")
+            "mqtt.connect() sin usuario ni contraseña: cualquier publicador del tópico controla la sirena.",
+            component="mqtt")
 
 
 def check_caddy(root):
@@ -194,35 +203,85 @@ CHECKS = [check_compose, check_mosquitto, check_actuator, check_firmware, check_
           check_dockerfiles, check_requirements, check_ignores, check_tracked_secrets]
 
 
+def load_scope(path):
+    """Devuelve {componente: entrada} de los componentes declarados fuera de alcance."""
+    if not path or not os.path.isfile(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    scope = {}
+    for entry in data.get("fuera_de_alcance") or []:
+        comp = str(entry.get("componente", "")).strip()
+        if comp and str(entry.get("motivo", "")).strip():   # sin motivo no se acepta la exclusión
+            scope[comp] = entry
+    return scope
+
+
+def md(text):
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
     ap.add_argument("--strict", action="store_true", help="los warnings también fallan")
+    ap.add_argument("--scope", default=".github/security/alcance.yml")
+    ap.add_argument("--json-out")
     args = ap.parse_args()
 
     for check in CHECKS:
         check(args.root)
 
+    scope = load_scope(os.path.join(args.root, args.scope) if not os.path.isabs(args.scope) else args.scope)
+    for f in findings:
+        if f["component"] in scope:
+            f["original_level"] = f["level"]
+            f["level"] = "fuera-de-alcance"
+            f["scope_state"] = scope[f["component"]].get("estado", "fuera-de-alcance")
+        elif args.strict:
+            f["level"] = "error"
+
+    in_scope = [f for f in findings if f["level"] != "fuera-de-alcance"]
+    out_scope = [f for f in findings if f["level"] == "fuera-de-alcance"]
+    errors = [f for f in in_scope if f["level"] == "error"]
+    warnings = [f for f in in_scope if f["level"] == "warning"]
+
     gha = os.environ.get("GITHUB_ACTIONS") == "true"
     for f in findings:
-        level = "error" if f["level"] == "error" or args.strict else "warning"
-        if gha:
-            print(f"::{level} file={f['path']},line={f['line']},title={f['rule']}::{f['message']}")
+        if f["level"] == "fuera-de-alcance":
+            tag, label = "notice", f"[fuera de alcance: {f['component']} {f['scope_state']}] "
         else:
-            print(f"[{level.upper():7}] {f['rule']:9} {f['path']}:{f['line']}  {f['message']}")
+            tag, label = f["level"], ""
+        if gha:
+            print(f"::{tag} file={f['path']},line={f['line']},title={f['rule']}::{label}{f['message']}")
+        else:
+            print(f"[{tag.upper():7}] {f['rule']:9} {f['path']}:{f['line']}  {label}{f['message']}")
 
-    errors = [f for f in findings if f["level"] == "error" or args.strict]
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            json.dump({"findings": findings, "scope": scope}, fh, ensure_ascii=False, indent=2)
+
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
             fh.write("## Chequeo de políticas (auditoría run-1)\n\n")
-            fh.write(f"**{len(errors)} bloqueantes, {len(findings) - len(errors)} avisos**\n\n")
-            if findings:
+            fh.write(f"**{len(errors)} bloqueantes · {len(warnings)} avisos · "
+                     f"{len(out_scope)} fuera de alcance**\n\n")
+            if in_scope:
                 fh.write("| Nivel | Regla | Archivo | Mensaje |\n|---|---|---|---|\n")
-                for f in sorted(findings, key=lambda x: (x["level"] != "error", x["rule"])):
-                    msg = f["message"].replace("|", "\\|")
-                    fh.write(f"| {f['level']} | {f['rule']} | `{f['path']}:{f['line']}` | {msg} |\n")
-    print(f"\n{len(errors)} bloqueante(s), {len(findings) - len(errors)} aviso(s).")
+                for f in sorted(in_scope, key=lambda x: (x["level"] != "error", x["rule"])):
+                    fh.write(f"| {f['level']} | {f['rule']} | `{f['path']}:{f['line']}` | {md(f['message'])} |\n")
+            for comp, entry in scope.items():
+                items = [f for f in out_scope if f["component"] == comp]
+                fh.write(f"\n### Fuera de alcance: `{comp}` ({entry.get('estado', '')})\n\n")
+                fh.write(f"{md(entry.get('motivo', ''))}\n\n**Revisar cuando:** {md(entry.get('revisar_cuando', '-'))}\n\n")
+                if items:
+                    fh.write("<details><summary>" + f"{len(items)} hallazgo(s) que no bloquean</summary>\n\n")
+                    fh.write("| Nivel original | Regla | Archivo | Mensaje |\n|---|---|---|---|\n")
+                    for f in items:
+                        fh.write(f"| {f['original_level']} | {f['rule']} | `{f['path']}:{f['line']}` | {md(f['message'])} |\n")
+                    fh.write("\n</details>\n")
+    print(f"\n{len(errors)} bloqueante(s), {len(warnings)} aviso(s), {len(out_scope)} fuera de alcance.")
     return 1 if errors else 0
 
 
