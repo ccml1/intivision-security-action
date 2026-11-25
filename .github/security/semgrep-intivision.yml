@@ -1,0 +1,157 @@
+# Reglas Semgrep propias, derivadas de la auditoría de seguridad (run-1).
+# ERROR bloquea el pipeline; WARNING e INFO se publican en Code Scanning para revisión.
+rules:
+  - id: intivision.blocking-analysis-in-async-handler
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Se llama a analyze_video() directamente dentro de un handler async. El análisis de video bloquea
+      el event loop y detiene el servicio para todos los usuarios (auditoría, pista 12).
+      Usa `await asyncio.to_thread(...)` o una cola de trabajos.
+    patterns:
+      # Semgrep no empareja "async def" con decorador (@app.post) sin la segunda forma.
+      - pattern-either:
+          - pattern-inside: |
+              async def $HANDLER(...):
+                  ...
+          - pattern-inside: |
+              @$DECORATOR(...)
+              async def $HANDLER(...):
+                  ...
+      - pattern: $ENGINE.analyze_video(...)
+      - pattern-not-inside: await asyncio.to_thread(...)
+      - pattern-not-inside: await $LOOP.run_in_executor(...)
+    metadata:
+      category: security
+      cwe: "CWE-400: Uncontrolled Resource Consumption"
+      audit: "backend/app.py:analyze:blocking-video-analysis-on-event-loop"
+
+  - id: intivision.sleep-in-async
+    languages: [python]
+    severity: ERROR
+    message: >-
+      time.sleep() dentro de una función async bloquea el event loop. Usa `await asyncio.sleep(...)`.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              async def $F(...):
+                  ...
+          - pattern-inside: |
+              @$DECORATOR(...)
+              async def $F(...):
+                  ...
+      - pattern: time.sleep(...)
+    metadata:
+      category: security
+      cwe: "CWE-400: Uncontrolled Resource Consumption"
+
+  - id: intivision.global-storage-key-first-claimant
+    languages: [python]
+    severity: WARNING
+    message: >-
+      INSERT de media_files con `ON CONFLICT (storage_key) DO NOTHING`: el primero que registra un nombre
+      se queda con él y /evidence le entrega el archivo que haya en disco con ese nombre, aunque lo
+      haya escrito otro usuario o comunidad (auditoría, pistas 2 y 3). Usa nombres únicos (UUID) por
+      evento y comunidad, y no aceptes nombres de archivo enviados por el cliente.
+    pattern-regex: (?i)ON\s+CONFLICT\s*\(\s*storage_key\s*\)\s*DO\s+NOTHING
+    paths:
+      include: ["*.py"]
+    metadata:
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      audit: "backend/app.py:evidence:first-claimant-storage-key-serves-shared-evidence-file"
+
+  - id: intivision.size-limit-from-content-length-only
+    languages: [python]
+    severity: WARNING
+    message: >-
+      El límite de tamaño se basa solo en la cabecera Content-Length. Una petición con
+      Transfer-Encoding: chunked no la envía y el cuerpo se recibe completo (auditoría, pista 14).
+      Cuenta los bytes al leer el cuerpo y limita también en Caddy (request_body max_size).
+    patterns:
+      - pattern-either:
+          - pattern: int($REQ.headers.get("content-length", ...))
+          - pattern: int($REQ.headers.get("Content-Length", ...))
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+      audit: "backend/app.py:content-length-only-request-size-gates"
+
+  - id: intivision.x-forwarded-for-trust
+    languages: [python]
+    severity: INFO
+    message: >-
+      Se usa X-Forwarded-For como IP del cliente. Confía en esa cabecera solo si la conexión viene de la
+      IP exacta del proxy (Caddy), no de cualquier red privada (auditoría, pista 7).
+    pattern-either:
+      - pattern: $REQ.headers.get("x-forwarded-for", ...)
+      - pattern: $REQ.headers.get("X-Forwarded-For", ...)
+      - pattern: $REQ.headers["x-forwarded-for"]
+    metadata:
+      category: security
+      cwe: "CWE-348: Use of Less Trusted Source"
+      audit: "backend/auth.py:client_ip:xff-trusted-from-any-private-peer"
+
+  - id: intivision.fileresponse-from-joined-path
+    languages: [python]
+    severity: INFO
+    message: >-
+      FileResponse sobre una ruta variable. Verifica que el archivo pertenezca al usuario (no solo que
+      exista una fila con ese nombre) y que la ruta no salga del directorio (auditoría, pista 3).
+    patterns:
+      - pattern: FileResponse($PATH, ...)
+      - pattern-not: FileResponse("...", ...)
+    metadata:
+      category: security
+      cwe: "CWE-22: Path Traversal"
+
+  # Componente MQTT fuera de alcance (no desarrollado, ver .github/security/alcance.yml):
+  # se sigue reportando como INFO para que no se pierda cuando se desarrolle.
+  - id: intivision.mqtt-without-tls
+    languages: [python]
+    severity: INFO
+    message: >-
+      [Fuera de alcance: módulo MQTT no desarrollado] Cliente MQTT que se conecta sin llamar antes a
+      tls_set(): las órdenes de la sirena y las credenciales viajarían sin cifrar (auditoría, pista 1).
+      Revisar antes de conectar un dispositivo físico o desplegar un broker.
+    patterns:
+      - pattern-inside: |
+          def $F(...):
+              ...
+              $C = mqtt.Client(...)
+              ...
+      - pattern-not-inside: |
+          def $F(...):
+              ...
+              $C.tls_set(...)
+              ...
+      - pattern: $C.connect(...)
+    metadata:
+      category: security
+      scope: fuera-de-alcance (mqtt, no-desarrollado)
+      cwe: "CWE-319: Cleartext Transmission of Sensitive Information"
+      audit: "wokwi/sketch.ino:onMessage:unauthenticated-siren-control-on-public-mqtt-broker"
+
+  - id: intivision.requests-exception-logged
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Se registra la excepción de `requests` tal cual. Si la URL lleva un token (por ejemplo
+      /bot<TOKEN>/ de Telegram), el token termina en los logs. Limpia el mensaje antes de registrarlo.
+    patterns:
+      - pattern-inside: |
+          try:
+              ...
+              requests.$M(...)
+              ...
+          except $EXC as $E:
+              ...
+      - pattern-either:
+          - pattern: $LOG.$LVL(..., $E, ...)
+          - pattern: $LOG.$LVL(f"...{$E}...", ...)
+      - metavariable-regex:
+          metavariable: $LVL
+          regex: ^(debug|info|warning|error|exception|critical)$
+    metadata:
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
